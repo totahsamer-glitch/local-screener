@@ -287,7 +287,7 @@ def apply_table_styles(df, oversold_val, overbought_val):
 
 # ==================== STREAMLIT UI ====================
 
-st.title("📊 Multi-Timeframe MA55, RSI, MACD & SMA Screener")
+st.title("📊 Regional shares Screener")
 st.caption(
     "Dynamic automated market screening for trading signals, MACD crossovers, SMA 13/34 crossovers, and Prev Day H/L Breakouts."
 )
