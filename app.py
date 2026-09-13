@@ -6,13 +6,17 @@ import yfinance as yf
 
 # Configure Web Page Layout
 st.set_page_config(
-    page_title="MA55 Channel & RSI Screener", page_icon="📊", layout="wide"
+    page_title="MA55 Channel, RSI, MACD & SMA Cross Screener",
+    page_icon="📊",
+    layout="wide",
 )
 
 # --- CONFIGURATION CONSTANTS ---
 TICKER_FILE = "tickers.txt"
 MA_PERIOD = 55
 RSI_PERIOD = 14
+SMA_FAST_PERIOD = 13
+SMA_SLOW_PERIOD = 34
 MAX_CANDLES_AGO = 10  # Look back up to 10 candles for breakout signals
 
 # Mapping display timeframes to yfinance interval & period parameters
@@ -55,6 +59,37 @@ def calculate_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 
+def calculate_macd(series, fast=12, slow=26, signal=9):
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+
+def find_latest_cross(fast_series, slow_series):
+    """Finds the type of cross (Bull/Bear) and how many candles ago it occurred."""
+    diff = fast_series - slow_series
+    crosses = (np.sign(diff) != np.sign(diff.shift(1))) & (diff.shift(1).notna())
+
+    cross_indices = np.where(crosses)[0]
+    if len(cross_indices) == 0:
+        return "None", None
+
+    latest_cross_idx = cross_indices[-1]
+    candles_ago = len(fast_series) - 1 - latest_cross_idx
+
+    if diff.iloc[latest_cross_idx] > 0 and diff.iloc[latest_cross_idx - 1] <= 0:
+        cross_type = "Bull Cross"
+    elif diff.iloc[latest_cross_idx] < 0 and diff.iloc[latest_cross_idx - 1] >= 0:
+        cross_type = "Bear Cross"
+    else:
+        cross_type = "None"
+
+    return cross_type, candles_ago
+
+
 def resample_4h(df):
     """Resample 1-hour data into 4-hour candles for accurate 4H MA calculation."""
     resampled = (
@@ -80,31 +115,57 @@ def run_screener(ticker_list, timeframe_label):
     interval = tf_info["interval"]
     period = tf_info["period"]
 
+    # 1. Download primary intraday / chosen timeframe data
     data = yf.download(
         ticker_list, period=period, interval=interval, group_by="ticker"
     )
+
+    # 2. Download FIXED 1D daily data specifically for Previous Day High/Low calculation
+    data_daily = yf.download(
+        ticker_list, period="1mo", interval="1d", group_by="ticker"
+    )
+
     results = []
 
     for ticker in ticker_list:
         try:
+            # Extract intraday dataframe
             if len(ticker_list) == 1:
                 df = data.copy()
+                df_d = data_daily.copy()
             else:
                 if ticker not in data.columns.levels[0]:
                     continue
                 df = data[ticker].dropna()
+                df_d = data_daily[ticker].dropna() if ticker in data_daily.columns.levels[0] else pd.DataFrame()
 
-            # Resample to 4H if selected
+            # Resample main DF to 4H if selected
             if timeframe_label == "4 Hours":
                 df = resample_4h(df)
 
-            min_required = MA_PERIOD + MAX_CANDLES_AGO + 2
-            if len(df) < min_required:
+            min_required = max(MA_PERIOD, SMA_SLOW_PERIOD, 26 + 9) + MAX_CANDLES_AGO + 2
+            if len(df) < min_required or len(df_d) < 2:
                 continue
 
+            # Calculate Previous Day High and Low (fixed from 1D daily candles)
+            prev_day_high = df_d["High"].iloc[-2]
+            prev_day_low = df_d["Low"].iloc[-2]
+
+            # Indicator Calculations
             df["MA_High"] = df["High"].rolling(window=MA_PERIOD).mean()
             df["MA_Low"] = df["Low"].rolling(window=MA_PERIOD).mean()
             df["RSI"] = calculate_rsi(df["Close"], RSI_PERIOD)
+
+            # SMA 13 & SMA 34
+            df["SMA13"] = df["Close"].rolling(window=SMA_FAST_PERIOD).mean()
+            df["SMA34"] = df["Close"].rolling(window=SMA_SLOW_PERIOD).mean()
+
+            # MACD (12, 26, 9)
+            df["MACD"], df["MACD_Signal"], df["MACD_Hist"] = calculate_macd(df["Close"])
+
+            # Detect MACD and SMA Crosses
+            macd_cross_status, macd_cross_ago = find_latest_cross(df["MACD"], df["MACD_Signal"])
+            sma_cross_status, sma_cross_ago = find_latest_cross(df["SMA13"], df["SMA34"])
 
             last_rsi = (
                 round(df["RSI"].iloc[-1], 2)
@@ -112,6 +173,7 @@ def run_screener(ticker_list, timeframe_label):
                 else None
             )
 
+            # Signal evaluation for MA55 Channel Breakouts / Touches
             for i in range(1, MAX_CANDLES_AGO + 2):
                 curr = df.iloc[-i]
                 prev = df.iloc[-i - 1]
@@ -150,14 +212,23 @@ def run_screener(ticker_list, timeframe_label):
                     status = "Touch Bear"
 
                 if status:
+                    # Dynamic rounding precision based on price magnitude
+                    decimals = 4 if c_close < 1.0 else 2
+
                     results.append({
                         "Ticker": ticker,
                         "Status": status,
                         "Candles Ago": i - 1,
-                        "Last Price": round(c_close, 2),
-                        "MA High": round(c_ma_h, 2),
-                        "MA Low": round(c_ma_l, 2),
+                        "Last Price": round(c_close, decimals),
+                        "MA High": round(c_ma_h, decimals),
+                        "MA Low": round(c_ma_l, decimals),
                         "RSI (14)": last_rsi,
+                        "MACD Signal": macd_cross_status,
+                        "MACD Cross Ago": macd_cross_ago,
+                        "SMA (13/34)": sma_cross_status,
+                        "SMA Cross Ago": sma_cross_ago,
+                        "Prev Day High": round(prev_day_high, decimals),
+                        "Prev Day Low": round(prev_day_low, decimals),
                     })
                     break
 
@@ -186,36 +257,56 @@ def style_rsi(val, oversold, overbought):
     return ""
 
 
+def style_pdh_pdl(df):
+    """Highlights Prev Day High green on a bullish breakout, and Prev Day Low red on a bearish breakout."""
+    styles = pd.DataFrame("", index=df.index, columns=df.columns)
+    
+    if "Last Price" in df.columns and "Prev Day High" in df.columns:
+        bull_breakout = df["Last Price"] > df["Prev Day High"]
+        styles.loc[bull_breakout, "Prev Day High"] = "background-color: #1b382b; color: #4eff9e; font-weight: bold;"
+        
+    if "Last Price" in df.columns and "Prev Day Low" in df.columns:
+        bear_breakout = df["Last Price"] < df["Prev Day Low"]
+        styles.loc[bear_breakout, "Prev Day Low"] = "background-color: #3d1c1d; color: #ff6b6b; font-weight: bold;"
+        
+    return styles
+
+
 def apply_table_styles(df, oversold_val, overbought_val):
-    return df.style.map(
-        style_status, subset=["Status"]
-    ).map(
-        style_rsi,
-        subset=["RSI (14)"],
-        oversold=oversold_val,
-        overbought=overbought_val,
+    return (
+        df.style.map(style_status, subset=["Status", "MACD Signal", "SMA (13/34)"])
+        .map(
+            style_rsi,
+            subset=["RSI (14)"],
+            oversold=oversold_val,
+            overbought=overbought_val,
+        )
+        .apply(style_pdh_pdl, axis=None)
     )
 
 
 # ==================== STREAMLIT UI ====================
 
-st.title("📊 Multi-Timeframe MA55 Channel & RSI Screener")
-st.caption("Dynamic automated market screening for trading signals across multiple timeframes.")
+st.title("📊 Multi-Timeframe MA55, RSI, MACD & SMA Screener")
+st.caption(
+    "Dynamic automated market screening for trading signals, MACD crossovers, SMA 13/34 crossovers, and Prev Day H/L Breakouts."
+)
 
 tickers = load_tickers(TICKER_FILE)
 
 # Sidebar Parameter Controls
 with st.sidebar:
     st.header("Screener Controls")
-    
+
     selected_tf = st.selectbox(
         "⏱ Select Timeframe",
         options=list(TIMEFRAME_CONFIG.keys()),
-        index=0  # Default to 1 Day
+        index=0,  # Default to 1 Day
     )
-    
+
     st.write(f"📁 Loaded Tickers: **{len(tickers)}**")
     st.write(f"📈 MA Channel: **{MA_PERIOD} Period ({selected_tf})**")
+    st.write(f"📊 SMA Cross: **13 / 34 ({selected_tf})**")
 
     st.markdown("---")
     st.subheader("RSI Thresholds")
@@ -269,14 +360,24 @@ if not df_results.empty:
     df_recent = df_results[df_results["Candles Ago"] <= 3]
     df_older = df_results[df_results["Candles Ago"] > 3]
 
+    # Dynamically determine formatting string per column based on price thresholds across the whole result set
+    is_penny = (df_results["Last Price"] < 1.0).any() if "Last Price" in df_results.columns else False
+    price_format = "$%.4f" if is_penny else "$%.2f"
+
     column_formatting = {
         "Ticker": st.column_config.TextColumn("Ticker"),
         "Status": st.column_config.TextColumn("Signal Type"),
         "Candles Ago": st.column_config.NumberColumn(f"Candles Ago ({time_unit})"),
-        "Last Price": st.column_config.NumberColumn("Last Price", format="$%.2f"),
-        "MA High": st.column_config.NumberColumn("MA High (55)", format="$%.2f"),
-        "MA Low": st.column_config.NumberColumn("MA Low (55)", format="$%.2f"),
+        "Last Price": st.column_config.NumberColumn("Last Price", format=price_format),
+        "MA High": st.column_config.NumberColumn("MA High (55)", format=price_format),
+        "MA Low": st.column_config.NumberColumn("MA Low (55)", format=price_format),
         "RSI (14)": st.column_config.NumberColumn("RSI (14)", format="%.2f"),
+        "MACD Signal": st.column_config.TextColumn("MACD Cross"),
+        "MACD Cross Ago": st.column_config.NumberColumn(f"MACD Ago ({time_unit})"),
+        "SMA (13/34)": st.column_config.TextColumn("SMA 13/34 Cross"),
+        "SMA Cross Ago": st.column_config.NumberColumn(f"SMA Ago ({time_unit})"),
+        "Prev Day High": st.column_config.NumberColumn("Prev Day High", format=price_format),
+        "Prev Day Low": st.column_config.NumberColumn("Prev Day Low", format=price_format),
     }
 
     st.subheader(f"🔥 Active Signals (Last 3 {time_unit})")
