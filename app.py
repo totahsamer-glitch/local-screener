@@ -6,7 +6,7 @@ import yfinance as yf
 
 # Configure Web Page Layout
 st.set_page_config(
-    page_title="MA55 Channel, RSI, MACD & SMA Cross Screener",
+    page_title="Region shares Screener",
     page_icon="📊",
     layout="wide",
 )
