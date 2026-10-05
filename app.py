@@ -6,7 +6,7 @@ import yfinance as yf
 
 # Configure Web Page Layout
 st.set_page_config(
-    page_title="US Stocks Screener",
+    page_title="Global Shares Screener",
     page_icon="📊",
     layout="wide",
 )
@@ -30,7 +30,7 @@ TIMEFRAME_CONFIG = {
 def load_tickers(filepath=TICKER_FILE):
     if not os.path.exists(filepath):
         st.warning(f"⚠️ '{filepath}' not found. Using default tickers.")
-        return ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
+        return ["AAPL", "MSFT", "TECOM.AE", "EMAAR.AE"]
 
     with open(filepath, "r") as f:
         tickers = [
@@ -105,6 +105,23 @@ def resample_4h(df):
     return resampled
 
 
+def extract_symbol_df(df_source, symbol):
+    """Safely extracts a single ticker's DataFrame handling MultiIndex columns."""
+    if df_source.empty:
+        return pd.DataFrame()
+
+    if isinstance(df_source.columns, pd.MultiIndex):
+        if symbol in df_source.columns.levels[0]:
+            sub_df = df_source[symbol].dropna(how="all")
+            return sub_df
+        elif symbol in df_source.columns.levels[1]:
+            sub_df = df_source.xs(symbol, axis=1, level=1).dropna(how="all")
+            return sub_df
+        return pd.DataFrame()
+    else:
+        return df_source.dropna(how="all")
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def run_screener(ticker_list, timeframe_label):
     if not ticker_list:
@@ -114,29 +131,35 @@ def run_screener(ticker_list, timeframe_label):
     interval = tf_info["interval"]
     period = tf_info["period"]
 
-    # 1. Download primary intraday / chosen timeframe data
+    # 1. Download primary data with auto_adjust=False (Fixes dividend price alterations)
     data = yf.download(
-        ticker_list, period=period, interval=interval, group_by="ticker"
+        ticker_list,
+        period=period,
+        interval=interval,
+        group_by="ticker",
+        auto_adjust=False,
+        progress=False,
     )
 
-    # 2. Download FIXED 1D daily data for Monday High/Low and First Week High/Low calculations
+    # 2. Download FIXED 1D daily data with auto_adjust=False
     data_daily = yf.download(
-        ticker_list, period="3mo", interval="1d", group_by="ticker"
+        ticker_list,
+        period="3mo",
+        interval="1d",
+        group_by="ticker",
+        auto_adjust=False,
+        progress=False,
     )
 
     results = []
 
     for ticker in ticker_list:
         try:
-            # Extract intraday dataframe
-            if len(ticker_list) == 1:
-                df = data.copy()
-                df_d = data_daily.copy()
-            else:
-                if ticker not in data.columns.levels[0]:
-                    continue
-                df = data[ticker].dropna()
-                df_d = data_daily[ticker].dropna() if ticker in data_daily.columns.levels[0] else pd.DataFrame()
+            df = extract_symbol_df(data, ticker)
+            df_d = extract_symbol_df(data_daily, ticker)
+
+            if df.empty or df_d.empty:
+                continue
 
             # Resample main DF to 4H if selected
             if timeframe_label == "4 Hours":
@@ -169,11 +192,9 @@ def run_screener(ticker_list, timeframe_label):
             current_day = last_date.day
 
             if current_day <= 7:
-                # Still within the first week of the month -> Leave blank
                 first_wk_high = np.nan
                 first_wk_low = np.nan
             else:
-                # Calculate High/Low for days 1 to 7 of the current month
                 month_mask = (df_d.index.year == current_year) & (df_d.index.month == current_month)
                 first_wk_mask = month_mask & (df_d.index.day <= 7)
                 first_wk_data = df_d[first_wk_mask]
@@ -189,14 +210,11 @@ def run_screener(ticker_list, timeframe_label):
             df["MA_High"] = df["High"].rolling(window=MA_PERIOD).mean()
             df["MA_Low"] = df["Low"].rolling(window=MA_PERIOD).mean()
             df["RSI"] = calculate_rsi(df["Close"], RSI_PERIOD)
-
-            # SMA 21 Calculation
             df["SMA21"] = df["Close"].rolling(window=SMA_21_PERIOD).mean()
 
             # MACD (12, 26, 9)
             df["MACD"], df["MACD_Signal"], df["MACD_Hist"] = calculate_macd(df["Close"])
 
-            # Detect MACD and Price vs SMA 21 Crosses
             macd_cross_status, macd_cross_ago = find_latest_cross(df["MACD"], df["MACD_Signal"])
             sma21_status, sma21_cross_ago = find_latest_cross(df["Close"], df["SMA21"])
 
@@ -245,8 +263,8 @@ def run_screener(ticker_list, timeframe_label):
                     status = "Touch Bear"
 
                 if status:
-                    # Dynamic rounding precision based on price magnitude
-                    decimals = 4 if c_close < 1.0 else 2
+                    # Precise decimals for low-value stock prices (e.g. Dubai shares around ~2.00-3.00 AED)
+                    decimals = 3 if c_close < 10.0 else 2
 
                     c_sma21 = curr["SMA21"]
 
@@ -343,21 +361,21 @@ def apply_table_styles(df, oversold_val, overbought_val):
 
 # ==================== STREAMLIT UI ====================
 
-st.title("📊 US shares Screener")
+st.title("📊 Global Shares Screener")
 st.caption(
-    "Dynamic automated market screening for trading signals, MACD crossovers, SMA 21 breakouts, Monday H/L, and First Week H/L Breakouts."
+    "Automated market screening with unadjusted raw market pricing for international tickers (DFM/Dubai, US, etc.)."
 )
 
 tickers = load_tickers(TICKER_FILE)
 
-# Sidebar Parameter Controls
+# Sidebar Controls
 with st.sidebar:
     st.header("Screener Controls")
 
     selected_tf = st.selectbox(
         "⏱ Select Timeframe",
         options=list(TIMEFRAME_CONFIG.keys()),
-        index=0,  # Default to 1 Day
+        index=0,
     )
 
     st.write(f"📁 Loaded Tickers: **{len(tickers)}**")
@@ -367,24 +385,11 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("RSI Thresholds")
 
-    rsi_oversold = st.slider(
-        "Oversold Threshold (Green)",
-        min_value=10,
-        max_value=45,
-        value=30,
-        step=1,
-    )
-
-    rsi_overbought = st.slider(
-        "Overbought Threshold (Red)",
-        min_value=55,
-        max_value=90,
-        value=70,
-        step=1,
-    )
+    rsi_oversold = st.slider("Oversold (Green)", 10, 45, 30, 1)
+    rsi_overbought = st.slider("Overbought (Red)", 55, 90, 70, 1)
 
     st.markdown("---")
-    if st.button("🔄 Force Manual Refresh", use_container_width=True):
+    if st.button("🔄 Clear Cache & Refresh", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
@@ -412,31 +417,26 @@ if not df_results.empty:
 
     st.markdown("---")
 
-    # Split output into Active (<= 3 candles ago) vs Earlier (> 3 candles ago)
     df_recent = df_results[df_results["Candles Ago"] <= 3]
     df_older = df_results[df_results["Candles Ago"] > 3]
-
-    # Dynamically determine formatting string per column based on price thresholds across the whole result set
-    is_penny = (df_results["Last Price"] < 1.0).any() if "Last Price" in df_results.columns else False
-    price_format = "$%.4f" if is_penny else "$%.2f"
 
     column_formatting = {
         "Ticker": st.column_config.TextColumn("Ticker"),
         "Status": st.column_config.TextColumn("Signal Type"),
         "Candles Ago": st.column_config.NumberColumn(f"Candles Ago ({time_unit})"),
-        "Last Price": st.column_config.NumberColumn("Last Price", format=price_format),
-        "MA High": st.column_config.NumberColumn("MA High", format=price_format),
-        "MA Low": st.column_config.NumberColumn("MA Low", format=price_format),
+        "Last Price": st.column_config.NumberColumn("Last Price", format="%.3f"),
+        "MA High": st.column_config.NumberColumn("MA High", format="%.3f"),
+        "MA Low": st.column_config.NumberColumn("MA Low", format="%.3f"),
         "RSI (14)": st.column_config.NumberColumn("RSI (14)", format="%.2f"),
         "MACD Signal": st.column_config.TextColumn("MACD Cross"),
         "MACD Cross Ago": st.column_config.NumberColumn(f"MACD Ago ({time_unit})"),
-        "SMA 21": st.column_config.NumberColumn("SMA 21", format=price_format),
+        "SMA 21": st.column_config.NumberColumn("SMA 21", format="%.3f"),
         "SMA 21 Cross": st.column_config.TextColumn("SMA 21 Cross"),
         "SMA 21 Cross Ago": st.column_config.NumberColumn(f"SMA 21 Ago ({time_unit})"),
-        "Monday High": st.column_config.NumberColumn("Monday High", format=price_format),
-        "Monday Low": st.column_config.NumberColumn("Monday Low", format=price_format),
-        "First Wk High": st.column_config.NumberColumn("First Wk High", format=price_format),
-        "First Wk Low": st.column_config.NumberColumn("First Wk Low", format=price_format),
+        "Monday High": st.column_config.NumberColumn("Monday High", format="%.3f"),
+        "Monday Low": st.column_config.NumberColumn("Monday Low", format="%.3f"),
+        "First Wk High": st.column_config.NumberColumn("First Wk High", format="%.3f"),
+        "First Wk Low": st.column_config.NumberColumn("First Wk Low", format="%.3f"),
     }
 
     st.subheader(f"🔥 Active Signals (Last 3 {time_unit})")
