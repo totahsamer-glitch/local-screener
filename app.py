@@ -119,7 +119,7 @@ def run_screener(ticker_list, timeframe_label):
         ticker_list, period=period, interval=interval, group_by="ticker"
     )
 
-    # 2. Download FIXED 1D daily data for Monday High/Low calculation
+    # 2. Download FIXED 1D daily data for Monday High/Low and First Week High/Low calculations
     data_daily = yf.download(
         ticker_list, period="3mo", interval="1d", group_by="ticker"
     )
@@ -146,16 +146,14 @@ def run_screener(ticker_list, timeframe_label):
             if len(df) < min_required or df_d.empty:
                 continue
 
-            # Check screening day and calculate Monday High/Low
             last_date = df_d.index[-1]
-            screening_day_of_week = last_date.dayofweek  # 0 = Monday
 
+            # 1. Monday High/Low Logic
+            screening_day_of_week = last_date.dayofweek  # 0 = Monday
             if screening_day_of_week == 0:
-                # Screening day is Monday -> Leave blank
                 monday_high = np.nan
                 monday_low = np.nan
             else:
-                # Find the most recent Monday in daily data
                 mondays = df_d[df_d.index.dayofweek == 0]
                 if not mondays.empty:
                     latest_monday = mondays.iloc[-1]
@@ -164,6 +162,28 @@ def run_screener(ticker_list, timeframe_label):
                 else:
                     monday_high = np.nan
                     monday_low = np.nan
+
+            # 2. First Week of Current Month High/Low Logic
+            current_year = last_date.year
+            current_month = last_date.month
+            current_day = last_date.day
+
+            if current_day <= 7:
+                # Still within the first week of the month -> Leave blank
+                first_wk_high = np.nan
+                first_wk_low = np.nan
+            else:
+                # Calculate High/Low for days 1 to 7 of the current month
+                month_mask = (df_d.index.year == current_year) & (df_d.index.month == current_month)
+                first_wk_mask = month_mask & (df_d.index.day <= 7)
+                first_wk_data = df_d[first_wk_mask]
+
+                if not first_wk_data.empty:
+                    first_wk_high = first_wk_data["High"].max()
+                    first_wk_low = first_wk_data["Low"].min()
+                else:
+                    first_wk_high = np.nan
+                    first_wk_low = np.nan
 
             # Indicator Calculations
             df["MA_High"] = df["High"].rolling(window=MA_PERIOD).mean()
@@ -245,6 +265,8 @@ def run_screener(ticker_list, timeframe_label):
                         "SMA 21 Cross Ago": sma21_cross_ago,
                         "Monday High": round(monday_high, decimals) if not pd.isna(monday_high) else np.nan,
                         "Monday Low": round(monday_low, decimals) if not pd.isna(monday_low) else np.nan,
+                        "First Wk High": round(first_wk_high, decimals) if not pd.isna(first_wk_high) else np.nan,
+                        "First Wk Low": round(first_wk_low, decimals) if not pd.isna(first_wk_low) else np.nan,
                     })
                     break
 
@@ -273,21 +295,35 @@ def style_rsi(val, oversold, overbought):
     return ""
 
 
-def style_monday_hl(df):
-    """Highlights Monday High green on a bullish breakout, and Monday Low red on a bearish breakout."""
+def style_breakouts(df):
+    """Highlights breakouts on Monday H/L and First Week H/L."""
     styles = pd.DataFrame("", index=df.index, columns=df.columns)
+    last_price = pd.to_numeric(df["Last Price"], errors="coerce") if "Last Price" in df.columns else None
 
-    if "Last Price" in df.columns and "Monday High" in df.columns:
+    if last_price is None:
+        return styles
+
+    # Monday Breakouts
+    if "Monday High" in df.columns:
         m_high = pd.to_numeric(df["Monday High"], errors="coerce")
-        last_price = pd.to_numeric(df["Last Price"], errors="coerce")
-        bull_breakout = m_high.notna() & (last_price > m_high)
-        styles.loc[bull_breakout, "Monday High"] = "background-color: #1b382b; color: #4eff9e; font-weight: bold;"
+        bull_m = m_high.notna() & (last_price > m_high)
+        styles.loc[bull_m, "Monday High"] = "background-color: #1b382b; color: #4eff9e; font-weight: bold;"
 
-    if "Last Price" in df.columns and "Monday Low" in df.columns:
+    if "Monday Low" in df.columns:
         m_low = pd.to_numeric(df["Monday Low"], errors="coerce")
-        last_price = pd.to_numeric(df["Last Price"], errors="coerce")
-        bear_breakout = m_low.notna() & (last_price < m_low)
-        styles.loc[bear_breakout, "Monday Low"] = "background-color: #3d1c1d; color: #ff6b6b; font-weight: bold;"
+        bear_m = m_low.notna() & (last_price < m_low)
+        styles.loc[bear_m, "Monday Low"] = "background-color: #3d1c1d; color: #ff6b6b; font-weight: bold;"
+
+    # First Week Breakouts
+    if "First Wk High" in df.columns:
+        fw_high = pd.to_numeric(df["First Wk High"], errors="coerce")
+        bull_fw = fw_high.notna() & (last_price > fw_high)
+        styles.loc[bull_fw, "First Wk High"] = "background-color: #1b382b; color: #4eff9e; font-weight: bold;"
+
+    if "First Wk Low" in df.columns:
+        fw_low = pd.to_numeric(df["First Wk Low"], errors="coerce")
+        bear_fw = fw_low.notna() & (last_price < fw_low)
+        styles.loc[bear_fw, "First Wk Low"] = "background-color: #3d1c1d; color: #ff6b6b; font-weight: bold;"
 
     return styles
 
@@ -301,7 +337,7 @@ def apply_table_styles(df, oversold_val, overbought_val):
             oversold=oversold_val,
             overbought=overbought_val,
         )
-        .apply(style_monday_hl, axis=None)
+        .apply(style_breakouts, axis=None)
     )
 
 
@@ -309,7 +345,7 @@ def apply_table_styles(df, oversold_val, overbought_val):
 
 st.title("📊 US shares Screener")
 st.caption(
-    "Dynamic automated market screening for trading signals, MACD crossovers, SMA 21 breakouts, and Monday H/L Breakouts."
+    "Dynamic automated market screening for trading signals, MACD crossovers, SMA 21 breakouts, Monday H/L, and First Week H/L Breakouts."
 )
 
 tickers = load_tickers(TICKER_FILE)
@@ -399,6 +435,8 @@ if not df_results.empty:
         "SMA 21 Cross Ago": st.column_config.NumberColumn(f"SMA 21 Ago ({time_unit})"),
         "Monday High": st.column_config.NumberColumn("Monday High", format=price_format),
         "Monday Low": st.column_config.NumberColumn("Monday Low", format=price_format),
+        "First Wk High": st.column_config.NumberColumn("First Wk High", format=price_format),
+        "First Wk Low": st.column_config.NumberColumn("First Wk Low", format=price_format),
     }
 
     st.subheader(f"🔥 Active Signals (Last 3 {time_unit})")
